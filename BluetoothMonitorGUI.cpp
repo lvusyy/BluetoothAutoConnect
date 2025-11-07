@@ -8,6 +8,8 @@
 #include <thread>
 #include <mutex>
 #include <fstream>
+#include <codecvt>
+#include <locale>
 
 #pragma comment(lib, "Bthprops.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -112,24 +114,30 @@ set<wstring> LoadConfig(const wstring& configFile) {
 
 // 保存配置文件
 bool SaveConfig(const wstring& configFile, const set<wstring>& monitorDevices) {
-    wofstream file(configFile);
+    // 使用 UTF-8 编码
+    wofstream file(configFile, ios::out | ios::trunc);
     
     if (!file.is_open()) {
         return false;
     }
     
-    file << L"# 蓝牙设备自动连接配置文件\r\n";
-    file << L"# 每行填写一个要监控的设备名称\r\n";
-    file << L"# 使用 # 开头的行为注释\r\n";
-    file << L"# 如果此文件为空或不存在，将监控所有已配对的设备\r\n";
-    file << L"\r\n";
+    // 设置 UTF-8 locale
+    file.imbue(locale(locale(), new codecvt_utf8<wchar_t>));
+    
+    file << L"# 蓝牙设备自动连接配置文件\n";
+    file << L"# 每行填写一个要监控的设备名称\n";
+    file << L"# 使用 # 开头的行为注释\n";
+    file << L"# 如果此文件为空或不存在，请右键添加设备到监控列表\n";
+    file << L"\n";
     
     for (const auto& deviceName : monitorDevices) {
-        file << deviceName << L"\r\n";
+        file << deviceName << L"\n";
     }
     
+    file.flush();
     file.close();
-    return true;
+    
+    return file.good() || !file.bad();
 }
 
 // 获取所有已配对的蓝牙设备
@@ -239,11 +247,19 @@ void UpdateDeviceList(const vector<BluetoothDeviceInfo>& devices, const set<wstr
     g_currentDevices = devices;
     g_monitorDevices = monitorDevices;
     
+    // 保存当前选中的设备名称
+    wstring selectedDeviceName;
+    int selectedIndex = ListView_GetNextItem(g_hwndDeviceList, -1, LVNI_SELECTED);
+    if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
+        selectedDeviceName = g_currentDevices[selectedIndex].name;
+    }
+    
     ListView_DeleteAllItems(g_hwndDeviceList);
     
+    int newSelectedIndex = -1;
     for (size_t i = 0; i < devices.size(); i++) {
         const auto& device = devices[i];
-        bool shouldMonitor = monitorDevices.empty() || monitorDevices.count(device.name) > 0;
+        bool shouldMonitor = !monitorDevices.empty() && monitorDevices.count(device.name) > 0;
         
         LVITEM lvi = {};
         lvi.mask = LVIF_TEXT;
@@ -260,6 +276,17 @@ void UpdateDeviceList(const vector<BluetoothDeviceInfo>& devices, const set<wstr
         
         const wchar_t* monitor = shouldMonitor ? L"是" : L"否";
         ListView_SetItemText(g_hwndDeviceList, (int)i, 3, (LPWSTR)monitor);
+        
+        // 记录之前选中的设备的新位置
+        if (!selectedDeviceName.empty() && device.name == selectedDeviceName) {
+            newSelectedIndex = (int)i;
+        }
+    }
+    
+    // 恢复选中状态
+    if (newSelectedIndex != -1) {
+        ListView_SetItemState(g_hwndDeviceList, newSelectedIndex, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(g_hwndDeviceList, newSelectedIndex, FALSE);
     }
 }
 
@@ -271,7 +298,7 @@ void ShowDeviceContextMenu(HWND hwnd) {
     if (selectedIndex >= (int)g_currentDevices.size()) return;
     
     const auto& device = g_currentDevices[selectedIndex];
-    bool isMonitored = g_monitorDevices.empty() || g_monitorDevices.count(device.name) > 0;
+    bool isMonitored = !g_monitorDevices.empty() && g_monitorDevices.count(device.name) > 0;
     
     POINT pt;
     GetCursorPos(&pt);
@@ -309,7 +336,11 @@ void MonitorThread() {
     AddLog(L"蓝牙设备自动连接程序已启动");
     AddLog(L"========================================");
     
-    set<wstring> monitorDevices = LoadConfig(L"config.txt");
+    // 使用全局配置，如果为空则从文件加载
+    if (g_monitorDevices.empty()) {
+        g_monitorDevices = LoadConfig(L"config.txt");
+    }
+    set<wstring> monitorDevices = g_monitorDevices;
     
     vector<BluetoothDeviceInfo> pairedDevices = GetPairedDevices();
     
@@ -323,7 +354,8 @@ void MonitorThread() {
     
     vector<BluetoothDeviceInfo> devicesToMonitor;
     for (const auto& device : pairedDevices) {
-        bool shouldMonitor = monitorDevices.empty() || monitorDevices.count(device.name) > 0;
+        // 只监控配置文件中明确指定的设备
+        bool shouldMonitor = !monitorDevices.empty() && monitorDevices.count(device.name) > 0;
         
         wstring msg = L"  - " + device.name + L" [" + BluetoothAddressToString(device.address) + L"]";
         msg += device.connected ? L" (已连接)" : L" (未连接)";
@@ -336,7 +368,8 @@ void MonitorThread() {
     
     if (devicesToMonitor.empty()) {
         AddLog(L"没有需要监控的设备");
-        AddLog(L"请在 config.txt 中配置设备名称");
+        AddLog(L"请右键点击设备列表中的设备，选择\"添加到监控列表\"");
+        UpdateDeviceList(pairedDevices, monitorDevices);
         return;
     }
     
@@ -493,6 +526,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // 创建托盘图标
         CreateTrayIcon(hwnd);
         
+        // 初始化配置文件（首次运行创建空配置）
+        wifstream testFile(L"config.txt");
+        if (!testFile.good()) {
+            // 文件不存在，创建空配置
+            set<wstring> emptyConfig;
+            SaveConfig(L"config.txt", emptyConfig);
+        }
+        testFile.close();
+        
         // 自动开始监控
         g_bRunning = true;
         g_pMonitorThread = new thread(MonitorThread);
@@ -636,19 +678,40 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
                 const auto& device = g_currentDevices[selectedIndex];
                 
-                if (g_monitorDevices.empty()) {
-                    g_monitorDevices = LoadConfig(L"config.txt");
-                    if (g_monitorDevices.empty()) {
-                        for (const auto& dev : g_currentDevices) {
-                            g_monitorDevices.insert(dev.name);
-                        }
-                    }
-                }
-                
+                // 重新加载配置
+                g_monitorDevices = LoadConfig(L"config.txt");
                 g_monitorDevices.insert(device.name);
                 
                 if (SaveConfig(L"config.txt", g_monitorDevices)) {
                     AddLog(L"已添加到监控列表: " + device.name);
+                    
+                    // 重启监控线程以应用更改
+                    if (g_bRunning && g_pMonitorThread) {
+                        g_bRunning = false;
+                        AddLog(L"正在重启监控...");
+                        
+                        thread* oldThread = g_pMonitorThread;
+                        g_pMonitorThread = nullptr;
+                        
+                        // 异步清理旧线程
+                        thread([oldThread, hwnd]() {
+                            if (oldThread && oldThread->joinable()) {
+                                oldThread->join();
+                            }
+                            delete oldThread;
+                            
+                            // 启动新线程
+                            Sleep(500);
+                            g_bRunning = true;
+                            g_pMonitorThread = new thread(MonitorThread);
+                        }).detach();
+                    } else if (!g_bRunning) {
+                        // 如果监控未运行，启动它
+                        g_bRunning = true;
+                        g_pMonitorThread = new thread(MonitorThread);
+                    }
+                    
+                    // 更新显示
                     vector<BluetoothDeviceInfo> devices = GetPairedDevices();
                     UpdateDeviceList(devices, g_monitorDevices);
                 } else {
@@ -664,10 +727,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
                 const auto& device = g_currentDevices[selectedIndex];
                 
+                // 重新加载配置
+                g_monitorDevices = LoadConfig(L"config.txt");
                 g_monitorDevices.erase(device.name);
                 
                 if (SaveConfig(L"config.txt", g_monitorDevices)) {
                     AddLog(L"已从监控列表移除: " + device.name);
+                    
+                    // 重启监控线程以应用更改
+                    if (g_bRunning && g_pMonitorThread) {
+                        g_bRunning = false;
+                        AddLog(L"正在重启监控...");
+                        
+                        thread* oldThread = g_pMonitorThread;
+                        g_pMonitorThread = nullptr;
+                        
+                        // 异步清理旧线程
+                        thread([oldThread, hwnd]() {
+                            if (oldThread && oldThread->joinable()) {
+                                oldThread->join();
+                            }
+                            delete oldThread;
+                            
+                            // 启动新线程（如果还有设备需要监控）
+                            Sleep(500);
+                            if (!g_monitorDevices.empty()) {
+                                g_bRunning = true;
+                                g_pMonitorThread = new thread(MonitorThread);
+                            }
+                        }).detach();
+                    }
+                    
+                    // 更新显示
                     vector<BluetoothDeviceInfo> devices = GetPairedDevices();
                     UpdateDeviceList(devices, g_monitorDevices);
                 } else {
