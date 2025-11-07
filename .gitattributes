@@ -1,0 +1,42 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# C/C++ source files
+*.cpp text eol=crlf
+*.h text eol=crlf
+*.c text eol=crlf
+*.hpp text eol=crlf
+
+# Resource files
+*.rc text eol=crlf
+
+# Batch scripts should use CRLF on Windows
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Markdown and text files
+*.md text eol=lf
+*.txt text eol=crlf
+README* text eol=lf
+
+# Config files
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Build files
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+Makefile text eol=lf
+
+# Git files
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Binary files
+*.ico binary
+*.exe binary
+*.dll binary
+*.lib binary
+*.obj binary
+*.pdb binary

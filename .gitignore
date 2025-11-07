@@ -1,0 +1,68 @@
+# 编译输出文件
+*.exe
+*.obj
+*.o
+*.pdb
+*.ilk
+*.idb
+*.res
+*.lib
+*.exp
+*.pch
+*.iobj
+*.ipdb
+
+# Visual Studio 临时文件
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.VC.opendb
+*.db
+*.opendb
+
+# Visual Studio 输出目录
+Debug/
+Release/
+x64/
+x86/
+[Dd]ebug/
+[Rr]elease/
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+
+# CMake 生成文件
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# MinGW 编译文件
+*.a
+*.dll
+*.so
+
+# 编辑器临时文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 日志和临时文件
+*.log
+*.tmp
+*.temp
+
+# 个人配置文件（保留示例）
+# config.txt 不忽略，因为这是示例配置
