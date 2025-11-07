@@ -16,16 +16,6 @@
 
 using namespace std;
 
-// 全局变量
-HINSTANCE g_hInst = nullptr;
-HWND g_hwndMain = nullptr;
-HWND g_hwndLog = nullptr;
-HWND g_hwndDeviceList = nullptr;
-NOTIFYICONDATAW g_nid = {};
-bool g_bRunning = true;
-mutex g_logMutex;
-thread* g_pMonitorThread = nullptr;
-
 // 窗口类名和标题
 const wchar_t CLASS_NAME[] = L"BluetoothMonitorClass";
 const wchar_t WINDOW_TITLE[] = L"蓝牙设备自动连接";
@@ -40,6 +30,13 @@ const wchar_t WINDOW_TITLE[] = L"蓝牙设备自动连接";
 #define ID_BTN_START 2003
 #define ID_BTN_STOP 2004
 #define ID_BTN_CLEAR 2005
+#define ID_DEVICE_CONNECT 3001
+#define ID_DEVICE_DISCONNECT 3002
+#define ID_DEVICE_COPY_MAC 3003
+#define ID_DEVICE_REFRESH 3004
+#define ID_DEVICE_COPY_NAME 3005
+#define ID_DEVICE_ADD_MONITOR 3006
+#define ID_DEVICE_REMOVE_MONITOR 3007
 
 // 蓝牙设备信息结构
 struct BluetoothDeviceInfo {
@@ -47,6 +44,18 @@ struct BluetoothDeviceInfo {
     wstring name;
     bool connected;
 };
+
+// 全局变量
+HINSTANCE g_hInst = nullptr;
+HWND g_hwndMain = nullptr;
+HWND g_hwndLog = nullptr;
+HWND g_hwndDeviceList = nullptr;
+NOTIFYICONDATAW g_nid = {};
+bool g_bRunning = true;
+mutex g_logMutex;
+thread* g_pMonitorThread = nullptr;
+vector<BluetoothDeviceInfo> g_currentDevices;
+set<wstring> g_monitorDevices;
 
 // 将 BLUETOOTH_ADDRESS 转换为字符串
 wstring BluetoothAddressToString(const BLUETOOTH_ADDRESS& addr) {
@@ -99,6 +108,28 @@ set<wstring> LoadConfig(const wstring& configFile) {
     
     file.close();
     return monitorDevices;
+}
+
+// 保存配置文件
+bool SaveConfig(const wstring& configFile, const set<wstring>& monitorDevices) {
+    wofstream file(configFile);
+    
+    if (!file.is_open()) {
+        return false;
+    }
+    
+    file << L"# 蓝牙设备自动连接配置文件\r\n";
+    file << L"# 每行填写一个要监控的设备名称\r\n";
+    file << L"# 使用 # 开头的行为注释\r\n";
+    file << L"# 如果此文件为空或不存在，将监控所有已配对的设备\r\n";
+    file << L"\r\n";
+    
+    for (const auto& deviceName : monitorDevices) {
+        file << deviceName << L"\r\n";
+    }
+    
+    file.close();
+    return true;
 }
 
 // 获取所有已配对的蓝牙设备
@@ -169,9 +200,44 @@ bool ConnectDevice(const BLUETOOTH_ADDRESS& address, const wstring& deviceName) 
     return false;
 }
 
+// 断开蓝牙设备
+bool DisconnectDevice(const BLUETOOTH_ADDRESS& address, const wstring& deviceName) {
+    wstring msg = L"尝试断开设备: " + deviceName + L" [" + BluetoothAddressToString(address) + L"]";
+    AddLog(msg);
+
+    BLUETOOTH_DEVICE_INFO deviceInfo = { 0 };
+    deviceInfo.dwSize = sizeof(BLUETOOTH_DEVICE_INFO);
+    deviceInfo.Address = address;
+
+    DWORD result = BluetoothGetDeviceInfo(NULL, &deviceInfo);
+    if (result != ERROR_SUCCESS) {
+        AddLog(L"  获取设备信息失败");
+        return false;
+    }
+
+    if (!deviceInfo.fConnected) {
+        AddLog(L"  设备未连接");
+        return true;
+    }
+
+    result = BluetoothSetServiceState(NULL, &deviceInfo, &HumanInterfaceDeviceServiceClass_UUID, BLUETOOTH_SERVICE_DISABLE);
+    
+    if (result == ERROR_SUCCESS) {
+        this_thread::sleep_for(chrono::milliseconds(500));
+        AddLog(L"  断开成功");
+        return true;
+    }
+    
+    AddLog(L"  断开失败");
+    return false;
+}
+
 // 更新设备列表显示
 void UpdateDeviceList(const vector<BluetoothDeviceInfo>& devices, const set<wstring>& monitorDevices) {
     if (!g_hwndDeviceList) return;
+    
+    g_currentDevices = devices;
+    g_monitorDevices = monitorDevices;
     
     ListView_DeleteAllItems(g_hwndDeviceList);
     
@@ -195,6 +261,46 @@ void UpdateDeviceList(const vector<BluetoothDeviceInfo>& devices, const set<wstr
         const wchar_t* monitor = shouldMonitor ? L"是" : L"否";
         ListView_SetItemText(g_hwndDeviceList, (int)i, 3, (LPWSTR)monitor);
     }
+}
+
+// 显示设备右键菜单
+void ShowDeviceContextMenu(HWND hwnd) {
+    int selectedIndex = ListView_GetNextItem(g_hwndDeviceList, -1, LVNI_SELECTED);
+    if (selectedIndex == -1) return;
+    
+    if (selectedIndex >= (int)g_currentDevices.size()) return;
+    
+    const auto& device = g_currentDevices[selectedIndex];
+    bool isMonitored = g_monitorDevices.empty() || g_monitorDevices.count(device.name) > 0;
+    
+    POINT pt;
+    GetCursorPos(&pt);
+    
+    HMENU hMenu = CreatePopupMenu();
+    
+    if (device.connected) {
+        AppendMenu(hMenu, MF_STRING, ID_DEVICE_DISCONNECT, L"断开连接");
+    } else {
+        AppendMenu(hMenu, MF_STRING, ID_DEVICE_CONNECT, L"手动连接");
+    }
+    
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    
+    if (isMonitored && !g_monitorDevices.empty()) {
+        AppendMenu(hMenu, MF_STRING, ID_DEVICE_REMOVE_MONITOR, L"从监控列表移除");
+    } else {
+        AppendMenu(hMenu, MF_STRING, ID_DEVICE_ADD_MONITOR, L"添加到监控列表");
+    }
+    
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hMenu, MF_STRING, ID_DEVICE_COPY_NAME, L"复制设备名称");
+    AppendMenu(hMenu, MF_STRING, ID_DEVICE_COPY_MAC, L"复制MAC地址");
+    AppendMenu(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hMenu, MF_STRING, ID_DEVICE_REFRESH, L"刷新设备列表");
+    
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(hMenu);
 }
 
 // 监控线程
@@ -407,11 +513,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_BTN_STOP:
             if (g_bRunning) {
                 g_bRunning = false;
-                if (g_pMonitorThread && g_pMonitorThread->joinable()) {
-                    g_pMonitorThread->join();
-                    delete g_pMonitorThread;
+                AddLog(L"正在停止监控...");
+                
+                // 异步等待线程结束
+                if (g_pMonitorThread) {
+                    thread cleanup_thread([](thread* pThread) {
+                        if (pThread && pThread->joinable()) {
+                            pThread->join();
+                            delete pThread;
+                        }
+                    }, g_pMonitorThread);
+                    cleanup_thread.detach();
                     g_pMonitorThread = nullptr;
                 }
+                
                 AddLog(L"监控已停止");
             }
             break;
@@ -432,8 +547,146 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_TRAY_EXIT:
             PostMessage(hwnd, WM_CLOSE, 0, 0);
             break;
+            
+        case ID_DEVICE_CONNECT:
+        {
+            int selectedIndex = ListView_GetNextItem(g_hwndDeviceList, -1, LVNI_SELECTED);
+            if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
+                const auto& device = g_currentDevices[selectedIndex];
+                thread([device]() {
+                    ConnectDevice(device.address, device.name);
+                    Sleep(1000);
+                    vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+                    UpdateDeviceList(devices, g_monitorDevices);
+                }).detach();
+            }
+            break;
+        }
+        
+        case ID_DEVICE_DISCONNECT:
+        {
+            int selectedIndex = ListView_GetNextItem(g_hwndDeviceList, -1, LVNI_SELECTED);
+            if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
+                const auto& device = g_currentDevices[selectedIndex];
+                thread([device]() {
+                    DisconnectDevice(device.address, device.name);
+                    Sleep(1000);
+                    vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+                    UpdateDeviceList(devices, g_monitorDevices);
+                }).detach();
+            }
+            break;
+        }
+        
+        case ID_DEVICE_COPY_NAME:
+        {
+            int selectedIndex = ListView_GetNextItem(g_hwndDeviceList, -1, LVNI_SELECTED);
+            if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
+                const auto& device = g_currentDevices[selectedIndex];
+                if (OpenClipboard(hwnd)) {
+                    EmptyClipboard();
+                    size_t size = (device.name.length() + 1) * sizeof(wchar_t);
+                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
+                    if (hMem) {
+                        memcpy(GlobalLock(hMem), device.name.c_str(), size);
+                        GlobalUnlock(hMem);
+                        SetClipboardData(CF_UNICODETEXT, hMem);
+                    }
+                    CloseClipboard();
+                    AddLog(L"已复制设备名称: " + device.name);
+                }
+            }
+            break;
+        }
+        
+        case ID_DEVICE_COPY_MAC:
+        {
+            int selectedIndex = ListView_GetNextItem(g_hwndDeviceList, -1, LVNI_SELECTED);
+            if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
+                const auto& device = g_currentDevices[selectedIndex];
+                wstring macAddr = BluetoothAddressToString(device.address);
+                if (OpenClipboard(hwnd)) {
+                    EmptyClipboard();
+                    size_t size = (macAddr.length() + 1) * sizeof(wchar_t);
+                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
+                    if (hMem) {
+                        memcpy(GlobalLock(hMem), macAddr.c_str(), size);
+                        GlobalUnlock(hMem);
+                        SetClipboardData(CF_UNICODETEXT, hMem);
+                    }
+                    CloseClipboard();
+                    AddLog(L"已复制MAC地址: " + macAddr);
+                }
+            }
+            break;
+        }
+        
+        case ID_DEVICE_REFRESH:
+        {
+            AddLog(L"正在刷新设备列表...");
+            vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+            UpdateDeviceList(devices, g_monitorDevices);
+            AddLog(L"设备列表已刷新");
+            break;
+        }
+        
+        case ID_DEVICE_ADD_MONITOR:
+        {
+            int selectedIndex = ListView_GetNextItem(g_hwndDeviceList, -1, LVNI_SELECTED);
+            if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
+                const auto& device = g_currentDevices[selectedIndex];
+                
+                if (g_monitorDevices.empty()) {
+                    g_monitorDevices = LoadConfig(L"config.txt");
+                    if (g_monitorDevices.empty()) {
+                        for (const auto& dev : g_currentDevices) {
+                            g_monitorDevices.insert(dev.name);
+                        }
+                    }
+                }
+                
+                g_monitorDevices.insert(device.name);
+                
+                if (SaveConfig(L"config.txt", g_monitorDevices)) {
+                    AddLog(L"已添加到监控列表: " + device.name);
+                    vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+                    UpdateDeviceList(devices, g_monitorDevices);
+                } else {
+                    AddLog(L"添加失败: 无法保存配置文件");
+                }
+            }
+            break;
+        }
+        
+        case ID_DEVICE_REMOVE_MONITOR:
+        {
+            int selectedIndex = ListView_GetNextItem(g_hwndDeviceList, -1, LVNI_SELECTED);
+            if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
+                const auto& device = g_currentDevices[selectedIndex];
+                
+                g_monitorDevices.erase(device.name);
+                
+                if (SaveConfig(L"config.txt", g_monitorDevices)) {
+                    AddLog(L"已从监控列表移除: " + device.name);
+                    vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+                    UpdateDeviceList(devices, g_monitorDevices);
+                } else {
+                    AddLog(L"移除失败: 无法保存配置文件");
+                }
+            }
+            break;
+        }
         }
         break;
+    
+    case WM_NOTIFY:
+    {
+        LPNMHDR pnmhdr = (LPNMHDR)lParam;
+        if (pnmhdr->idFrom == ID_DEVICE_LIST && pnmhdr->code == NM_RCLICK) {
+            ShowDeviceContextMenu(hwnd);
+        }
+        break;
+    }
     
     case WM_TRAYICON:
         if (lParam == WM_RBUTTONUP) {
@@ -453,17 +706,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     
     case WM_CLOSE:
         if (MessageBox(hwnd, L"确定要退出程序吗？", L"确认", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            // 停止监控
             g_bRunning = false;
-            if (g_pMonitorThread && g_pMonitorThread->joinable()) {
-                g_pMonitorThread->join();
-                delete g_pMonitorThread;
-            }
+            
+            // 删除托盘图标
             Shell_NotifyIcon(NIM_DELETE, &g_nid);
+            
+            // 直接销毁窗口，让WM_DESTROY处理线程清理
             DestroyWindow(hwnd);
         }
         break;
     
     case WM_DESTROY:
+        // 确保监控已停止
+        g_bRunning = false;
+        
+        // 异步清理线程，不阻塞UI
+        if (g_pMonitorThread) {
+            thread* pThreadToClean = g_pMonitorThread;
+            g_pMonitorThread = nullptr;
+            
+            // 创建一个清理线程
+            thread([pThreadToClean]() {
+                if (pThreadToClean) {
+                    if (pThreadToClean->joinable()) {
+                        pThreadToClean->join();
+                    }
+                    delete pThreadToClean;
+                }
+            }).detach();
+        }
+        
         PostQuitMessage(0);
         break;
     

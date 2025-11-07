@@ -73,7 +73,7 @@ cl.exe /EHsc /std:c++17 /utf-8 /D_UNICODE /DUNICODE BluetoothMonitor.cpp /link B
 
 **GUI 版本:**
 ```cmd
-cl.exe /EHsc /std:c++17 /utf-8 /D_UNICODE /DUNICODE BluetoothMonitorGUI.cpp /link Bthprops.lib ws2_32.lib comctl32.lib shell32.lib /SUBSYSTEM:WINDOWS /OUT:BluetoothMonitorGUI.exe
+cl.exe /EHsc /std:c++17 /utf-8 /D_UNICODE /DUNICODE BluetoothMonitorGUI.cpp /link Bthprops.lib ws2_32.lib comctl32.lib shell32.lib user32.lib /SUBSYSTEM:WINDOWS /OUT:BluetoothMonitorGUI.exe
 ```
 
 ## 使用方法

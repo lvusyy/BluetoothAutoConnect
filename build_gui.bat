@@ -14,7 +14,7 @@ if %errorlevel% neq 0 (
 
 echo 正在编译 GUI 版本...
 cl.exe /EHsc /std:c++17 /utf-8 /D_UNICODE /DUNICODE BluetoothMonitorGUI.cpp ^
-    /link Bthprops.lib ws2_32.lib comctl32.lib shell32.lib ^
+    /link Bthprops.lib ws2_32.lib comctl32.lib shell32.lib user32.lib ^
     /SUBSYSTEM:WINDOWS ^
     /OUT:BluetoothMonitorGUI.exe
 
