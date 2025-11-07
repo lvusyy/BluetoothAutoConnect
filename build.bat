@@ -14,7 +14,7 @@ if %errorlevel% neq 0 (
 
 echo 正在编译...
 cl.exe /EHsc /std:c++17 /utf-8 /D_UNICODE /DUNICODE BluetoothMonitor.cpp ^
-    /link Bthprops.lib ws2_32.lib ^
+    /link Bthprops.lib ws2_32.lib shell32.lib ^
     /OUT:BluetoothMonitor.exe
 
 if %errorlevel% equ 0 (

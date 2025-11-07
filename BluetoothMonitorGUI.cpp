@@ -10,10 +10,12 @@
 #include <fstream>
 #include <codecvt>
 #include <locale>
+#include <unordered_map>
 
 #pragma comment(lib, "Bthprops.lib")
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "user32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 using namespace std;
@@ -58,6 +60,11 @@ mutex g_logMutex;
 thread* g_pMonitorThread = nullptr;
 vector<BluetoothDeviceInfo> g_currentDevices;
 set<wstring> g_monitorDevices;
+// 手动断开后，阻止自动重连的设备（按MAC字符串标识）
+set<wstring> g_blockAutoReconnect;
+// 每台设备的重连冷却时间戳
+unordered_map<wstring, chrono::steady_clock::time_point> g_lastConnectAttempt;
+static const int CONNECT_COOLDOWN_MS = 8000; // 8秒冷却
 
 // 将 BLUETOOTH_ADDRESS 转换为字符串
 wstring BluetoothAddressToString(const BLUETOOTH_ADDRESS& addr) {
@@ -140,6 +147,15 @@ bool SaveConfig(const wstring& configFile, const set<wstring>& monitorDevices) {
     return file.good() || !file.bad();
 }
 
+// 名称匹配：patterns 中任意一项作为子串出现在 text 中即认为匹配
+bool MatchAnySubstring(const wstring& text, const set<wstring>& patterns) {
+    if (patterns.empty()) return true;
+    for (const auto& p : patterns) {
+        if (!p.empty() && text.find(p) != wstring::npos) return true;
+    }
+    return false;
+}
+
 // 获取所有已配对的蓝牙设备
 vector<BluetoothDeviceInfo> GetPairedDevices() {
     vector<BluetoothDeviceInfo> devices;
@@ -173,10 +189,91 @@ vector<BluetoothDeviceInfo> GetPairedDevices() {
     return devices;
 }
 
-// 连接蓝牙设备
+// 带可选主动查询的设备获取（用于提高“在线/可连接”检测的及时性）
+vector<BluetoothDeviceInfo> GetPairedDevicesWithInquiry(bool doInquiry) {
+    vector<BluetoothDeviceInfo> devices;
+    
+    BLUETOOTH_DEVICE_SEARCH_PARAMS searchParams = { 0 };
+    searchParams.dwSize = sizeof(BLUETOOTH_DEVICE_SEARCH_PARAMS);
+    searchParams.fReturnAuthenticated = TRUE;
+    searchParams.fReturnRemembered = TRUE;
+    searchParams.fReturnConnected = TRUE;
+    searchParams.fReturnUnknown = FALSE;
+    searchParams.fIssueInquiry = doInquiry ? TRUE : FALSE;
+    searchParams.cTimeoutMultiplier = doInquiry ? 2 : 1;
+
+    BLUETOOTH_DEVICE_INFO deviceInfo = { 0 };
+    deviceInfo.dwSize = sizeof(BLUETOOTH_DEVICE_INFO);
+
+    HBLUETOOTH_DEVICE_FIND hFind = BluetoothFindFirstDevice(&searchParams, &deviceInfo);
+    
+    if (hFind != NULL) {
+        do {
+            BluetoothDeviceInfo info;
+            info.address = deviceInfo.Address;
+            info.name = deviceInfo.szName;
+            info.connected = deviceInfo.fConnected;
+            devices.push_back(info);
+        } while (BluetoothFindNextDevice(hFind, &deviceInfo));
+        
+        BluetoothFindDeviceClose(hFind);
+    }
+    
+    return devices;
+}
+
+// 辅助：错误码转字符串
+wstring Win32ErrorToString(DWORD code) {
+    LPWSTR buf = nullptr;
+    DWORD len = FormatMessageW(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, code, 0, (LPWSTR)&buf, 0, NULL);
+    wstring msg = len ? wstring(buf) : L"";
+    if (buf) LocalFree(buf);
+    return msg;
+}
+
+// 辅助：GUID 转字符串
+wstring GuidToString(const GUID& g) {
+    wchar_t buf[64];
+    swprintf_s(buf, 64, L"{%08lX-%04hX-%04hX-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+        g.Data1, g.Data2, g.Data3,
+        g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3], g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+    return wstring(buf);
+}
+
+// 辅助：打开第一个蓝牙无线电句柄
+HANDLE OpenFirstRadio() {
+    BLUETOOTH_FIND_RADIO_PARAMS params = { sizeof(BLUETOOTH_FIND_RADIO_PARAMS) };
+    HBLUETOOTH_RADIO_FIND hFind = nullptr;
+    HANDLE hRadio = nullptr;
+    hFind = BluetoothFindFirstRadio(&params, &hRadio);
+    if (hFind != NULL) {
+        BluetoothFindRadioClose(hFind);
+        return hRadio;
+    }
+    return nullptr;
+}
+
+// 辅助：判断服务是否为音频相关
+bool IsAudioService(const GUID& guid) {
+    return (guid == AudioSinkServiceClass_UUID ||
+            guid == AudioSourceServiceClass_UUID ||
+            guid == AVRemoteControlTargetServiceClass_UUID ||
+            guid == AVRemoteControlServiceClass_UUID ||
+            guid == HandsfreeServiceClass_UUID ||
+            guid == HeadsetServiceClass_UUID);
+}
+
+// 辅助：判断服务是否为 GATT 服务
+bool IsGATTService(const GUID& guid) {
+    return (guid.Data1 == 0x1800 || guid.Data1 == 0x1801) &&
+           guid.Data2 == 0x0000 && guid.Data3 == 0x1000;
+}
+
+// 连接蓝牙设备（参考提供的代码：通过禁用/启用音频相关服务触发连接）
 bool ConnectDevice(const BLUETOOTH_ADDRESS& address, const wstring& deviceName) {
-    wstring msg = L"尝试连接设备: " + deviceName + L" [" + BluetoothAddressToString(address) + L"]";
-    AddLog(msg);
+    AddLog(L"尝试连接设备: " + deviceName + L" [" + BluetoothAddressToString(address) + L"]");
 
     BLUETOOTH_DEVICE_INFO deviceInfo = { 0 };
     deviceInfo.dwSize = sizeof(BLUETOOTH_DEVICE_INFO);
@@ -184,7 +281,7 @@ bool ConnectDevice(const BLUETOOTH_ADDRESS& address, const wstring& deviceName) 
 
     DWORD result = BluetoothGetDeviceInfo(NULL, &deviceInfo);
     if (result != ERROR_SUCCESS) {
-        AddLog(L"  获取设备信息失败");
+        AddLog(L"  获取设备信息失败: " + to_wstring(result) + L" " + Win32ErrorToString(result));
         return false;
     }
 
@@ -193,22 +290,88 @@ bool ConnectDevice(const BLUETOOTH_ADDRESS& address, const wstring& deviceName) 
         return true;
     }
 
-    result = BluetoothSetServiceState(NULL, &deviceInfo, &HumanInterfaceDeviceServiceClass_UUID, BLUETOOTH_SERVICE_ENABLE);
-    
-    if (result == ERROR_SUCCESS) {
-        this_thread::sleep_for(chrono::milliseconds(500));
-        result = BluetoothGetDeviceInfo(NULL, &deviceInfo);
-        if (result == ERROR_SUCCESS && deviceInfo.fConnected) {
-            AddLog(L"  连接成功");
-            return true;
+    HANDLE hRadio = OpenFirstRadio();
+    if (!hRadio) {
+        AddLog(L"  未找到蓝牙适配器");
+        return false;
+    }
+
+    // 优先从“已安装服务”中过滤目标服务，减少 1060/87 错误
+    vector<GUID> installed;
+    {
+        const DWORD CAP = 32;
+        GUID guids[CAP] = {};
+        DWORD returned = CAP;
+        DWORD er = BluetoothEnumerateInstalledServices(hRadio, &deviceInfo, &returned, guids);
+        if (er == ERROR_SUCCESS && returned > 0) {
+            for (DWORD i = 0; i < returned; ++i) installed.push_back(guids[i]);
         }
     }
-    
+
+    auto contains = [](const vector<GUID>& vec, const GUID& g) {
+        for (const auto& x : vec) if (x == g) return true; return false;
+    };
+
+    // 参考实现：先禁用再启用常见音频相关服务（按优先级）
+    vector<GUID> wanted = {
+        AudioSinkServiceClass_UUID,                 // A2DP 音频接收器
+        AudioSourceServiceClass_UUID,               // A2DP 音频源
+        HandsfreeServiceClass_UUID,                 // 免提
+        HeadsetServiceClass_UUID,                   // 头戴式/耳机
+        AVRemoteControlTargetServiceClass_UUID,     // AVRCP 目标
+        AVRemoteControlServiceClass_UUID            // AVRCP 控制器
+    };
+
+    vector<GUID> services;
+    if (!installed.empty()) {
+        for (const auto& g : wanted) if (contains(installed, g)) services.push_back(g);
+    }
+    if (services.empty()) services = wanted; // 无法枚举时按全量尝试
+
+    bool anySuccess = false;
+    for (const auto& svc : services) {
+        // 先禁用
+        BluetoothSetServiceState(hRadio, &deviceInfo, &svc, BLUETOOTH_SERVICE_DISABLE);
+        Sleep(150);
+
+        // 再启用（先用 hRadio，87 时回退到 NULL）
+        DWORD r = BluetoothSetServiceState(hRadio, &deviceInfo, &svc, BLUETOOTH_SERVICE_ENABLE);
+        if (r == ERROR_INVALID_PARAMETER) {
+            r = BluetoothSetServiceState(NULL, &deviceInfo, &svc, BLUETOOTH_SERVICE_ENABLE);
+        }
+        if (r == ERROR_SUCCESS) {
+            anySuccess = true;
+            AddLog(L"  成功启用服务: " + GuidToString(svc));
+            Sleep(1200);
+
+            // 检查是否已连接
+            DWORD r2 = BluetoothGetDeviceInfo(NULL, &deviceInfo);
+            if (r2 == ERROR_SUCCESS && deviceInfo.fConnected) {
+                AddLog(L"  连接成功");
+                CloseHandle(hRadio);
+                return true;
+            }
+        } else if (r == ERROR_SERVICE_DOES_NOT_EXIST) {
+            // 跳过未安装的服务
+        } else {
+            AddLog(L"  启用服务失败: " + to_wstring(r) + L" " + Win32ErrorToString(r));
+        }
+    }
+
+    // 最终再检查一次连接状态
+    DWORD r3 = BluetoothGetDeviceInfo(NULL, &deviceInfo);
+    if (r3 == ERROR_SUCCESS && deviceInfo.fConnected) {
+        AddLog(L"  连接成功");
+        CloseHandle(hRadio);
+        return true;
+    }
+
+    CloseHandle(hRadio);
     AddLog(L"  连接失败");
     return false;
 }
 
-// 断开蓝牙设备
+// 断开蓝牙设备（遍历已安装服务逐一禁用）
 bool DisconnectDevice(const BLUETOOTH_ADDRESS& address, const wstring& deviceName) {
     wstring msg = L"尝试断开设备: " + deviceName + L" [" + BluetoothAddressToString(address) + L"]";
     AddLog(msg);
@@ -219,7 +382,7 @@ bool DisconnectDevice(const BLUETOOTH_ADDRESS& address, const wstring& deviceNam
 
     DWORD result = BluetoothGetDeviceInfo(NULL, &deviceInfo);
     if (result != ERROR_SUCCESS) {
-        AddLog(L"  获取设备信息失败");
+        AddLog(L"  获取设备信息失败: " + to_wstring(result) + L" " + Win32ErrorToString(result));
         return false;
     }
 
@@ -228,16 +391,50 @@ bool DisconnectDevice(const BLUETOOTH_ADDRESS& address, const wstring& deviceNam
         return true;
     }
 
-    result = BluetoothSetServiceState(NULL, &deviceInfo, &HumanInterfaceDeviceServiceClass_UUID, BLUETOOTH_SERVICE_DISABLE);
-    
-    if (result == ERROR_SUCCESS) {
-        this_thread::sleep_for(chrono::milliseconds(500));
-        AddLog(L"  断开成功");
-        return true;
+    HANDLE hRadio = OpenFirstRadio();
+    if (!hRadio) {
+        AddLog(L"  无法打开本地蓝牙适配器");
+        return false;
     }
     
-    AddLog(L"  断开失败");
-    return false;
+    vector<GUID> serviceGuids;
+    const DWORD CAP = 32;
+    GUID guids[CAP] = {};
+    DWORD returned = CAP;
+    result = BluetoothEnumerateInstalledServices(hRadio, &deviceInfo, &returned, guids);
+    if (result == ERROR_SUCCESS && returned > 0) {
+        for (DWORD i = 0; i < returned; ++i) serviceGuids.push_back(guids[i]);
+    }
+
+    if (serviceGuids.empty()) {
+        serviceGuids.push_back(HumanInterfaceDeviceServiceClass_UUID);      // HID
+        serviceGuids.push_back(HandsfreeServiceClass_UUID);                 // 免提
+        serviceGuids.push_back(AudioSinkServiceClass_UUID);                 // 音频接收器
+        serviceGuids.push_back(AudioSourceServiceClass_UUID);               // 音频源
+        serviceGuids.push_back(HeadsetServiceClass_UUID);                   // 头戴式/耳机
+        serviceGuids.push_back(AVRemoteControlTargetServiceClass_UUID);     // AVRCP 目标
+        serviceGuids.push_back(AVRemoteControlServiceClass_UUID);           // AVRCP 控制器
+        serviceGuids.push_back(SerialPortServiceClass_UUID);                // 串口
+    }
+
+    bool ok = false;
+    for (const auto& svc : serviceGuids) {
+        result = BluetoothSetServiceState(hRadio, &deviceInfo, &svc, BLUETOOTH_SERVICE_DISABLE);
+        if (result == ERROR_SUCCESS) ok = true;
+    }
+
+    if (hRadio) CloseHandle(hRadio);
+    this_thread::sleep_for(chrono::milliseconds(500));
+
+    AddLog(ok ? L"  断开成功" : L"  断开失败");
+
+    // 若断开成功，标记此设备禁止自动重连，直到用户手动连接为止
+    if (ok) {
+        wstring key = BluetoothAddressToString(address);
+        g_blockAutoReconnect.insert(key);
+        AddLog(L"  已设置为手动断开：自动重连已禁用（直到手动连接）");
+    }
+    return ok;
 }
 
 // 更新设备列表显示
@@ -259,7 +456,7 @@ void UpdateDeviceList(const vector<BluetoothDeviceInfo>& devices, const set<wstr
     int newSelectedIndex = -1;
     for (size_t i = 0; i < devices.size(); i++) {
         const auto& device = devices[i];
-        bool shouldMonitor = !monitorDevices.empty() && monitorDevices.count(device.name) > 0;
+        bool shouldMonitor = !monitorDevices.empty() && MatchAnySubstring(device.name, monitorDevices);
         
         LVITEM lvi = {};
         lvi.mask = LVIF_TEXT;
@@ -342,7 +539,7 @@ void MonitorThread() {
     }
     set<wstring> monitorDevices = g_monitorDevices;
     
-    vector<BluetoothDeviceInfo> pairedDevices = GetPairedDevices();
+vector<BluetoothDeviceInfo> pairedDevices = GetPairedDevicesWithInquiry(true);
     
     if (pairedDevices.empty()) {
         AddLog(L"未找到已配对的蓝牙设备");
@@ -354,8 +551,8 @@ void MonitorThread() {
     
     vector<BluetoothDeviceInfo> devicesToMonitor;
     for (const auto& device : pairedDevices) {
-        // 只监控配置文件中明确指定的设备
-        bool shouldMonitor = !monitorDevices.empty() && monitorDevices.count(device.name) > 0;
+        // 只监控配置文件中明确指定的设备（子串匹配）
+        bool shouldMonitor = !monitorDevices.empty() && MatchAnySubstring(device.name, monitorDevices);
         
         wstring msg = L"  - " + device.name + L" [" + BluetoothAddressToString(device.address) + L"]";
         msg += device.connected ? L" (已连接)" : L" (未连接)";
@@ -383,10 +580,19 @@ void MonitorThread() {
     }
 
     int checkCount = 0;
+    int scanCount = 0;
+    
     while (g_bRunning) {
         checkCount++;
         
-        vector<BluetoothDeviceInfo> currentDevices = GetPairedDevices();
+        // 每 3 次检查做一次主动扫描
+        bool doInquiry = (checkCount % 3) == 0;
+        if (doInquiry) {
+            scanCount++;
+            AddLog(L"[" + to_wstring(checkCount) + L"] 执行主动扫描 #" + to_wstring(scanCount) + L"...");
+        }
+        
+        vector<BluetoothDeviceInfo> currentDevices = GetPairedDevicesWithInquiry(doInquiry);
         UpdateDeviceList(currentDevices, monitorDevices);
         
         for (size_t i = 0; i < devicesToMonitor.size(); i++) {
@@ -394,27 +600,55 @@ void MonitorThread() {
             
             const auto& pairedDevice = devicesToMonitor[i];
             bool currentlyConnected = false;
+            bool deviceFound = false;
             
             for (const auto& current : currentDevices) {
                 if (memcmp(&current.address, &pairedDevice.address, sizeof(BLUETOOTH_ADDRESS)) == 0) {
                     currentlyConnected = current.connected;
+                    deviceFound = true;
                     break;
                 }
             }
             
+            if (!deviceFound) {
+                continue;
+            }
+            
             if (currentlyConnected && !lastConnectedState[i]) {
-                wstring msg = L"[" + to_wstring(checkCount) + L"] 检测到设备上线: " + pairedDevice.name;
-                AddLog(msg);
+                AddLog(L"[" + to_wstring(checkCount) + L"] ✅ 设备已连接: " + pairedDevice.name);
                 lastConnectedState[i] = true;
             }
             else if (!currentlyConnected && lastConnectedState[i]) {
-                wstring msg = L"[" + to_wstring(checkCount) + L"] 检测到设备离线: " + pairedDevice.name;
-                AddLog(msg);
-                lastConnectedState[i] = false;
+                // 二次确认，避免误判
+                BLUETOOTH_DEVICE_INFO di = {0};
+                di.dwSize = sizeof(BLUETOOTH_DEVICE_INFO);
+                di.Address = pairedDevice.address;
+                DWORD rchk = BluetoothGetDeviceInfo(NULL, &di);
+                if (rchk == ERROR_SUCCESS && di.fConnected) {
+                    // 仍然连接，跳过
+                } else {
+                    AddLog(L"[" + to_wstring(checkCount) + L"] ❌ 设备已断开: " + pairedDevice.name);
+                    lastConnectedState[i] = false;
+                }
             }
-            else if (!currentlyConnected) {
-                wstring msg = L"[" + to_wstring(checkCount) + L"] 设备未连接，尝试建立连接: " + pairedDevice.name;
-                AddLog(msg);
+            else if (!currentlyConnected && doInquiry) {
+                AddLog(L"[" + to_wstring(checkCount) + L"] 🔍 发现设备未连接，尝试连接: " + pairedDevice.name);
+                // 自动重连前检查：是否被手动断开阻止，以及是否处于冷却期
+                wstring mac = BluetoothAddressToString(pairedDevice.address);
+                if (g_blockAutoReconnect.count(mac) > 0) {
+                    AddLog(L"  ⏸ 用户手动断开，跳过自动重连: " + pairedDevice.name);
+                    continue;
+                }
+                auto now = chrono::steady_clock::now();
+                auto it = g_lastConnectAttempt.find(mac);
+                if (it != g_lastConnectAttempt.end()) {
+                    auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - it->second).count();
+                    if (elapsed < CONNECT_COOLDOWN_MS) {
+                        AddLog(L"  ⏱ 冷却中，跳过本次重连: " + pairedDevice.name);
+                        continue;
+                    }
+                }
+                g_lastConnectAttempt[mac] = now;
                 if (ConnectDevice(pairedDevice.address, pairedDevice.name)) {
                     lastConnectedState[i] = true;
                 }
@@ -596,9 +830,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (selectedIndex != -1 && selectedIndex < (int)g_currentDevices.size()) {
                 const auto& device = g_currentDevices[selectedIndex];
                 thread([device]() {
+                    // 手动连接前，取消自动重连阻止
+                    wstring mac = BluetoothAddressToString(device.address);
+                    g_blockAutoReconnect.erase(mac);
                     ConnectDevice(device.address, device.name);
                     Sleep(1000);
-                    vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+vector<BluetoothDeviceInfo> devices = GetPairedDevicesWithInquiry(true);
                     UpdateDeviceList(devices, g_monitorDevices);
                 }).detach();
             }
@@ -613,7 +850,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 thread([device]() {
                     DisconnectDevice(device.address, device.name);
                     Sleep(1000);
-                    vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+vector<BluetoothDeviceInfo> devices = GetPairedDevicesWithInquiry(true);
                     UpdateDeviceList(devices, g_monitorDevices);
                 }).detach();
             }
@@ -666,7 +903,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_DEVICE_REFRESH:
         {
             AddLog(L"正在刷新设备列表...");
-            vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+vector<BluetoothDeviceInfo> devices = GetPairedDevicesWithInquiry(true);
             UpdateDeviceList(devices, g_monitorDevices);
             AddLog(L"设备列表已刷新");
             break;
@@ -712,7 +949,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     
                     // 更新显示
-                    vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+vector<BluetoothDeviceInfo> devices = GetPairedDevicesWithInquiry(true);
                     UpdateDeviceList(devices, g_monitorDevices);
                 } else {
                     AddLog(L"添加失败: 无法保存配置文件");
@@ -759,7 +996,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                     
                     // 更新显示
-                    vector<BluetoothDeviceInfo> devices = GetPairedDevices();
+vector<BluetoothDeviceInfo> devices = GetPairedDevicesWithInquiry(true);
                     UpdateDeviceList(devices, g_monitorDevices);
                 } else {
                     AddLog(L"移除失败: 无法保存配置文件");
