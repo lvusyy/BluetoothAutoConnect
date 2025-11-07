@@ -1,0 +1,73 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # 触发条件：推送以 v 开头的标签，如 v1.3, v2.0 等
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+      
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+        
+    - name: Build Console Version
+      run: |
+        cl.exe /EHsc /std:c++17 /utf-8 /D_UNICODE /DUNICODE BluetoothMonitor.cpp /link Bthprops.lib ws2_32.lib /OUT:BluetoothMonitor.exe
+      shell: cmd
+      
+    - name: Build GUI Version
+      run: |
+        cl.exe /EHsc /std:c++17 /utf-8 /D_UNICODE /DUNICODE BluetoothMonitorGUI.cpp /link Bthprops.lib ws2_32.lib comctl32.lib shell32.lib user32.lib /SUBSYSTEM:WINDOWS /OUT:BluetoothMonitorGUI.exe
+      shell: cmd
+      
+    - name: Package files
+      run: |
+        mkdir release
+        copy BluetoothMonitor.exe release\
+        copy BluetoothMonitorGUI.exe release\
+        copy config.txt release\
+        copy README.md release\
+        copy LICENSE release\
+      shell: cmd
+      
+    - name: Create ZIP archive
+      run: |
+        Compress-Archive -Path release\* -DestinationPath BluetoothAutoConnect-${{ github.ref_name }}.zip
+      shell: pwsh
+      
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          BluetoothAutoConnect-${{ github.ref_name }}.zip
+          release/BluetoothMonitor.exe
+          release/BluetoothMonitorGUI.exe
+        body: |
+          ## 蓝牙设备自动连接程序 ${{ github.ref_name }}
+          
+          ### 下载说明
+          - `BluetoothMonitor.exe` - 控制台版本
+          - `BluetoothMonitorGUI.exe` - GUI版本（推荐）
+          - `BluetoothAutoConnect-${{ github.ref_name }}.zip` - 完整压缩包（包含所有文件）
+          
+          ### 使用方法
+          1. 下载对应版本的可执行文件
+          2. 在 Windows 设置中先配对蓝牙设备
+          3. 运行程序即可自动监控和连接
+          
+          详细说明请查看 [README.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md)
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
